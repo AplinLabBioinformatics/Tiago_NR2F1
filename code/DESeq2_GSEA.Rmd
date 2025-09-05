@@ -1,0 +1,686 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-07-22"
+---
+
+## Install package for running GSEA
+```{r}
+devtools::install_github("AplinLabBioinformatics/runGSEA")
+
+```
+
+## Core variables
+```{r}
+
+# Project and path
+sraProj <- "CM_NR2F1"
+resultsDir1 <- file.path("C:/data/results", sraProj)
+
+# sample metadata file
+sampleMetadataFile <- file.path(resultsDir1, "SampleSet.txt")
+
+# Set RSEM dir
+rsemDir <- file.path(resultsDir1, "RSEM")
+
+# Set gtf file path
+gtffile <- "C:/data/reference/gencode.v35.annotation.gtf.gz"
+
+# Isoform expression files
+rsemIsoformFiles <- dir(rsemDir, pattern = "isoforms.results", full.names = TRUE)
+
+
+## Configure paths for GSEA
+
+# GSEA software path
+pathToBatIn <- "C:/path/to/GSEA_4.1.0/GSEA_4.1.0"
+
+# Main metric. See runGSEA for all options.
+GSEAmetric <- "Signal2Noise" # "log2_Ratio_of_Classes"
+
+# Folder with files downloaded from GSEA, mSigDB, or other external sources (.chip and .gmt files)
+chipFile <- "C:/path/to/chip/Human_ENSEMBL_Gene_ID_MSigDB.v7.2.chip"
+gmtDir <- "C:/path/to/gmt/msigdb_v7.2"
+
+# .gmt Gene identifier
+gmtFileType <- ".v7.2.symbols.gmt"
+
+# list with prefixes of desired gene set collections to perform GSEA across comparisons
+gmtsKeep <- c("h.all", "c2.cp", "c5.go")
+
+# GSEA results folder
+gseaResDir <- file.path(resultsDir1, "GSEA", "results")
+dir.create(gseaResDir, recursive = T)
+
+# GSEA data folder
+gseaDataDir <- file.path(resultsDir1, "GSEA", "data")
+dir.create(gseaDataDir)
+
+
+```
+
+## Metadata
+```{r}
+
+# Adjust names of file variable 
+names(rsemIsoformFiles) <- gsub("[.].*","",basename(rsemIsoformFiles))
+
+# Read in sample annotation
+pData0 <- read.table(sampleMetadataFile, stringsAsFactors = FALSE, 
+                     header = TRUE, sep = "\t", row.names = 1)
+pData0$rowNames <- rownames(pData0)
+
+# Get columns to add to RSEM annotation df
+annotColsOfInterest <- c("Treatment", "cellLine", "NR2F1", "Condition")
+
+# Generate phenotype df 
+pAnnot <- data.frame(sample = names(rsemIsoformFiles), fileName = unname(rsemIsoformFiles), 
+                     stringsAsFactors = FALSE, row.names = names(rsemIsoformFiles))
+pAnnot$rowNames <- rownames(pAnnot)
+
+# Merge metadata
+pAnnot <- dplyr::left_join(pAnnot, pData0[,c("rowNames", annotColsOfInterest)], 
+                           by = c("rowNames" = "rowNames"), na_matches = "never")
+
+# Re-apply row names
+rownames(pAnnot) <- pAnnot$rowNames
+
+# Remove as now unnecessary 
+pAnnot$rowNames <- NULL
+
+pAnnot$NR2F1 <- toupper(pAnnot$NR2F1)
+
+# Annotate cell line, replicate number and treatment 
+pAnnot$BioRepNum <- gsub("^.*[_]([^_]*)$", "\\1", pAnnot$sample)
+
+
+# List of merge strings
+mergeStrings <- list()
+mergeStrings[["Sample_Name"]] <- c("cellLine", "Treatment", "NR2F1", "BioRepNum")
+mergeStrings[["Group_Name"]] <- c("cellLine", "Treatment", "NR2F1")
+mergeStrings[["condition"]] <- c("Treatment", "NR2F1")
+
+
+for( i in 1:length(mergeStrings)){
+  cellAnnot2 <- pAnnot[, mergeStrings[[i]]]
+  cellAnnot2 <- cellAnnot2[,vapply(cellAnnot2, 
+                                   function(x) length(unique(x)) > 1, 
+                                   logical(1L)), drop = F]
+  cellAnnotTemp <- apply(cellAnnot2, 1, paste, collapse="_")
+  cellAnnot2[,names(mergeStrings[i])] = NA
+  pAnnot[names(cellAnnotTemp), names(mergeStrings[i])] = unname(cellAnnotTemp)
+  rm(cellAnnot2, cellAnnotTemp)
+}
+
+# Create factor with group levels
+pAnnot$group_names <- pAnnot$Group_Name
+pAnnot$Group <- factor(pAnnot$Group_Name)
+pAnnot$group <- factor(gsub("-","_", pAnnot$Group_Name))
+pAnnot$Condition <- factor(gsub("-","_", pAnnot$condition), 
+                           levels = c("DMSO_NO_DOX", "DMSO_DOX", "Combo_NO_DOX", "Combo_DOX"))
+pAnnot$Cell_Line <- factor(pAnnot$cellLine)
+
+# Finish row names
+rownames(pAnnot) <- pAnnot$sample
+
+```
+
+# Read in data
+## Get gene/isoform annotation exclusively from a GTF file
+```{r}
+library("GenomicFeatures")
+library("tximport")
+
+txdb2 <- makeTxDbFromGFF(gtffile, organism = "Homo sapiens") #, format = "gtf"
+
+k <- keys(txdb2, keytype = "TXNAME")
+tx2gene <- select(txdb2, k, "GENEID", "TXNAME")
+
+# Create a df with gene names along with ENSG IDs
+gtf_df <- as.data.frame(rtracklayer::import(gtffile))
+gtf_gene <- unique(gtf_df[,c("gene_name", "gene_id", "gene_type")])
+rownames(gtf_gene) <- gtf_gene$gene_id
+gtf_gene$gene_id_stable <- gsub("[.]\\d*", "", gtf_gene$gene_id) # Keeps "PAR_Y"
+
+# Set if the ENSG IDs are version or not
+if (any(grepl("[.]",tx2gene$GENEID))){
+  filterOn <- "ensembl_gene_id_version"
+} else {
+  filterOn <- "ensembl_gene_id"
+}
+
+# Clean up
+rm(txdb2, k, gtf_df)
+detach("package:GenomicFeatures", unload=TRUE)
+
+# Add to running methods
+if (exists("methodsUsed")){
+  methodsUsed[length(methodsUsed)+1] <- paste0("Gene annotation data were accessed from ", gtffile,".")
+} else {
+  methodsUsed <- paste0("Gene annotation data were accessed from ", gtffile,".")
+}
+
+```
+
+## Read isoforms in via tximport
+```{r}
+
+if (any(grepl("[.]",tx2gene$GENEID))){
+  filterOn <- "ensembl_gene_id_version"
+} else {
+  filterOn <- "ensembl_gene_id"
+}
+
+if (filterOn == "ensembl_gene_id_version"){
+  rsemIsoformsIn2 <- tximport(rsemIsoformFiles[rownames(pAnnot)], type = "rsem", 
+                              txIn = TRUE, tx2gene = tx2gene, ignoreTxVersion = FALSE) 
+} else {
+  rsemIsoformsIn2 <- tximport(rsemIsoformFiles[rownames(pAnnot)], type = "rsem", 
+                              txIn = TRUE, tx2gene = tx2gene, ignoreTxVersion = TRUE)
+}
+
+methodsUsed[length(methodsUsed)+1] = paste0("RSEM isoforms data were read into R using tximport (v", 
+                                            package.version("tximport"), ".")
+```
+
+# DESeq2
+## Make DESeq2 object and check PCA
+```{r}
+library(DESeq2)
+
+# Comparison
+dd <- DESeqDataSetFromTximport(rsemIsoformsIn2, pAnnot[colnames(rsemIsoformsIn2$counts),], ~Group)
+
+# Reduce to rows with at least 1 counts
+keep <- rowSums(counts(dd)) >= 1
+dds <- DESeq(dd[keep,])
+rm(keep)
+
+# PCA plot of samples
+vsd <- vst(dds, blind=T)
+
+library(ggplot2)
+pcaAnnotCols <- c("cellLine", "condition")
+
+pcaData <- plotPCA(vsd, intgroup=pcaAnnotCols, returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes_string("PC1", "PC2", shape=pcaAnnotCols[1], color=pcaAnnotCols[2])) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + theme_bw()
+
+fnOut <- file.path(resultsDir1, paste0(format(Sys.time() ,"%Y%m%d.%H%M"),".PCA.", 
+                                       paste(pcaAnnotCols, collapse = "."),".png"))
+ggsave(fnOut, dpi = "print")
+
+
+colsAdd <- c("PC1", "PC2")
+colsAddAs <- c("PC1_AllSamples", "PC2_AllSamples")
+pAnnot[, colsAddAs] <- pcaData[rownames(pAnnot), colsAdd]
+
+```
+
+# DEG
+## Set Variables, for each cell line, compare each condition vs control treatment
+```{r}
+treatments <- levels(pAnnot$Condition)
+allCombs <- combn(treatments,2)
+allCombs <- allCombs[c(2,1),]
+allCombs <- allCombs[,c(1,2,5,6)]
+
+# Create a data frame with all contrast comparisons to perform
+contrasts_df <- data.frame(column = NA, denom = NA, numer = NA, compLbl = NA)
+contrasts_df <- contrasts_df[0,]
+
+# The column for the contrast
+colNameContrast <-"Group"
+
+# For each cell line, make contrasts for treated vs DMSO
+for(i in 1:length(unique(pAnnot$cellLine))){
+  
+  # Temp cell line to abbreviate
+  tempCellLine <-unique(pAnnot$cellLine)[i]
+
+  tmpTrtd <- paste0(tempCellLine, "_", allCombs[1,])
+  tmpCtrl <- paste0(tempCellLine, "_", allCombs[2,])
+  
+  tempCompColAdd <- paste0(allCombs[1,], ".vs.", allCombs[2,], "_", tempCellLine)
+
+  # Which row to start adding info
+  tmpStartRow <- dim(contrasts_df)[1] + 1
+  tmpFinalRow <- dim(contrasts_df)[1] + length(tmpTrtd)
+  
+  # Add comparisons
+  contrasts_df[tmpStartRow: tmpFinalRow, "denom"] <- tmpCtrl
+  contrasts_df[tmpStartRow: tmpFinalRow, "numer"] <- tmpTrtd
+  contrasts_df[tmpStartRow: tmpFinalRow, "compLbl"] <- tempCompColAdd
+  contrasts_df[tmpStartRow: tmpFinalRow, "column"] <- colNameContrast
+  
+  # Clean up
+  rm(tempCellLine, tmpTrtd, tmpCtrl, tempCompColAdd, tmpStartRow, tmpFinalRow)
+}
+
+# resultsNames(dds)
+# Preallocate
+temp.dds.res <- results(dds, contrast = c(contrasts_df$column[1], contrasts_df$numer[1], contrasts_df$denom[1]))
+
+# Make DF
+temp.dds.res_df <- as.data.frame(temp.dds.res)
+
+# Get all columns to be added
+predefColsToAdd <- paste0(rep(colnames(temp.dds.res_df), length(contrasts_df$compLbl)), 
+       "_", rep(contrasts_df$compLbl, each = length(colnames(temp.dds.res_df))))
+
+# create df
+dds.res_df <- data.frame(ENSG = rownames(temp.dds.res_df), row.names = rownames(temp.dds.res_df))
+
+
+# Clean up
+rm(temp.dds.res, temp.dds.res_df)
+
+# Add stable ENSG and gene names
+dds.res_df$geneNames <- gtf_gene[rownames(dds.res_df), "gene_name"]
+dds.res_df$ENSG_stable <- gsub("[.]\\d*", "", rownames(dds.res_df)) # Keeps "PAR_Y"
+
+# preallocate df
+dds.res_df[, predefColsToAdd] <- NA
+
+# Perform analysis for each comparison
+for(i in 1:dim(contrasts_df)[1]){
+  # Get temp results for first comparison
+  temp.dds.res <- results(dds, contrast = c(contrasts_df$column[i], contrasts_df$numer[i], contrasts_df$denom[i]))
+  
+  # Make DF
+  temp.dds.res_df <- as.data.frame(temp.dds.res)
+  
+  # Add comparison label to columns
+  colnames(temp.dds.res_df) <- paste0(colnames(temp.dds.res_df), "_", contrasts_df$compLbl[i])
+  
+  # Add comparison results to compiled results df
+  dds.res_df[, colnames(temp.dds.res_df)] <- temp.dds.res_df[rownames(dds.res_df), ]
+
+  # Clean up
+  rm(temp.dds.res, temp.dds.res_df)
+}
+```
+
+
+
+## Write results to file
+```{r}
+# dds.res_ntcts
+fnOut <- file.path(resultsDir1, paste0(format(Sys.time(), "%Y%m%d.%H%M"), ".Stat.results.NormCounts.txt"))
+
+ntcts <- as.data.frame(counts(dds, normalized = TRUE))
+ntcts$ENSG <- row.names(ntcts)
+dds.res_df.normOut <- dplyr::left_join(dds.res_df[,!grepl("^baseMean", colnames(dds.res_df))], 
+                                       ntcts, by = c("ENSG" = "ENSG"), na_matches = "never")
+dds.res_df.normOut[,grep("lfcSE", colnames(dds.res_df.normOut), value = T)] <- NULL
+
+write.table(dds.res_df.normOut, fnOut, row.names = F, col.names = T, sep = "\t")
+
+fnOutMethods <- file.path(resultsDir1, paste0(format(Sys.time(), "%Y%m%d.%H%M"), ".methods.txt"))
+
+write.table(methodsUsed, fnOutMethods, row.names = F, col.names = T, sep = "\t")
+```
+
+
+
+## Add methods to dds object and save as rds
+```{r}
+gtf_gene$gene_id_stable <- gsub("[.]\\d*", "", gtf_gene$gene_id) # Keeps "PAR_Y"
+
+mcols(dds)$gene_name <- gtf_gene_df[rownames(mcols(dds)), "gene_name"]
+mcols(dds)$gene_type <- gtf_gene_df[rownames(mcols(dds)), "gene_type"]
+mcols(dds)$gene_id <- gtf_gene_df[rownames(mcols(dds)), "gene_id"]
+mcols(dds)$gene_id_stable <- gtf_gene_df[rownames(mcols(dds)), "gene_id_stable"]
+
+if(!exists("dds@metadata$Methods")){
+  dds@metadata$Methods = paste0("RNA Seq data were aligned to the GRCh38 human reference genome using Star (v2.7.0) method [PMID: 23104886] and GENCODE (v35)[PMID: 30357393] annotations.")
+} else {
+  dds@metadata$Methods[length(dds@metadata$Methods)+1 ] = paste0("RNA Seq data were aligned to the GRCh38 human reference genome using Star (v2.7.0) method [PMID: 23104886] and GENCODE (v35)[PMID: 30357393] annotations.")
+}
+dds@metadata$Methods[length(dds@metadata$Methods)+1 ] = paste0("RSEM (v1.2.28) [PMID: 21816040] was used to quantify gene and transcript level expression.")
+dds@metadata$Methods[length(dds@metadata$Methods)+1 ] = paste0("Data normalization and differential expression analysis was performed using the DESeq2 package (v", packageVersion("DESeq2"), ")[PMID: 25516281].")
+
+
+DESeq2objFileOut <- file.path(resultsDir1, paste0(format(Sys.time(), "%Y%m%d.%H%M."), sraProj, "_withMethods.Rds"))
+saveRDS(dds, DESeq2objFileOut)
+
+```
+
+# Heatmaps of data
+
+## Average expression per group
+```{r}
+library(pheatmap)
+# Get notmalized expression
+ntcts <- as.data.frame(counts(dds, normalized = TRUE))
+
+normCts_grpAvg <- ntcts[ , 1:length(unique(pAnnot$group_names))]
+normCts_grpAvg[,] <- NA
+colnames(normCts_grpAvg) <- paste0("Avg_",unique(pAnnot$group_names))
+
+for(i in 1:length(unique(pAnnot$group_names))){
+  tmpCellLine <- unique(pAnnot$group_names)[i]
+  tmpLabel <- paste0("Avg_",tmpCellLine)
+  
+  tmpSmpsUse <- rownames(pAnnot)[pAnnot$group_names == tmpCellLine]
+  tmpMeans <- rowMeans(ntcts[,tmpSmpsUse])
+  normCts_grpAvg[names(tmpMeans), tmpLabel] <- unname(tmpMeans)
+  rm(tmpCellLine, tmpLabel, tmpSmpsUse, tmpMeans)
+}
+
+annotGrps <- data.frame(row.names = colnames(normCts_grpAvg), group_names = colnames(normCts_grpAvg))
+annotGrps$Cell_line <- gsub("Avg_(.{5}[^_]*?)[_]([^_]*)[_](.*)", "\\1", row.names(annotGrps))
+annotGrps$treatment <- gsub("Avg_(.{5}[^_]*?)[_]([^_]*)[_](.*)", "\\2", row.names(annotGrps))
+annotGrps$NR2F1 <- gsub("Avg_(.{5}[^_]*?)[_]([^_]*)[_](.*)", "\\3", row.names(annotGrps))
+annotGrps$condition <- gsub("Avg_(.{5}[^_]*?)[_]([^_]*)[_](.*)", "\\2_\\3", row.names(annotGrps))
+
+# Condition factor with desired order of condition
+annotGrps$Condition <- factor(annotGrps$condition, levels = c("DMSO_NO_DOX", "DMSO_DOX", 
+                                                              "Combo_NO_DOX", "Combo_DOX"))
+
+# Set other factors
+annotGrps$Treatment <- factor(annotGrps$treatment, levels = c("DMSO", "Combo"))
+annotGrps$NR2F1_exp <- factor(annotGrps$NR2F1, levels = c("NO_DOX", "DOX"))
+annotGrps$Cell_Line <- factor(annotGrps$Cell_line, levels = c("1205LuTR", "WM793", "A375_A"))
+
+genesCheck <- c("NR2F1", "MITF", "SOX10", "AXL")
+
+# Subset to desired gene names
+normCts_grpAvg2 <- normCts_grpAvg[row.names(gtf_gene)[match(genesCheck, gtf_gene$gene_name)], ]
+
+# Convert to HUGO symbols
+if(all(row.names(normCts_grpAvg2) %in% row.names(gtf_gene))){ 
+  row.names(normCts_grpAvg2) = gtf_gene[row.names(normCts_grpAvg2), "gene_name"] }
+
+# Generate heatmap
+pheatmap(normCts_grpAvg2, display_numbers = T, breaks = seq(from=-3, to = 3, length.out = 101), 
+         annotation_col = annotGrps[ ,c("Cell_Line", "condition")], scale = "row",
+         cluster_cols = F)
+
+# Reorder based on condition and cell line
+annotGrps <- annotGrps[with(annotGrps, order(Cell_Line, Condition)),]
+
+# Re-order columns to match desired order
+normCts_grpAvg2 <- normCts_grpAvg2[,row.names(annotGrps)]
+
+# Plot with desired order
+pheatmap(normCts_grpAvg2, display_numbers = T, breaks = seq(from=-3, to = 3, length.out = 101), 
+         annotation_col = annotGrps[ ,c("Cell_Line", "Condition")], scale = "row",
+         cluster_cols = F, gaps_col = seq(from=length(levels(annotGrps$Condition)), 
+                                          to=nrow(annotGrps), by=length(levels(annotGrps$Condition))))
+
+pheatmap(normCts_grpAvg2, display_numbers = T, breaks = seq(from=-2, to = 2, length.out = 101), 
+         annotation_col = annotGrps[ ,c("Cell_Line", "Condition")], scale = "row",
+         cluster_cols = F, gaps_col = seq(from=length(levels(annotGrps$Condition)), 
+                                          to=nrow(annotGrps), by=length(levels(annotGrps$Condition))))
+
+pheatmap(normCts_grpAvg2, display_numbers = T, breaks = seq(from=-2, to = 2, length.out = 101), 
+         annotation_col = annotGrps[ ,c("Treatment", "NR2F1_exp", "Cell_Line")], scale = "row",
+         cluster_cols = F, gaps_col = seq(from=4, to=15, by=4))
+
+# Add group average norm counts for output
+normCts_grpAvg$ENSG <- row.names(normCts_grpAvg)
+dds.res_df.out <- dplyr::left_join(dds.res_df[,!grepl("^baseMean", colnames(dds.res_df))], 
+                                   normCts_grpAvg, by = c("ENSG" = "ENSG"), na_matches = "never")
+dds.res_df.out[,grep("lfcSE", colnames(dds.res_df.out), value = T)] <- NULL
+
+fnOut <- file.path(resultsDir1, paste0(format(Sys.time(), "%Y%m%d.%H%M"), ".Stat.results.AvgNormCounts.txt"))
+write.table(dds.res_df.out, fnOut, row.names = F, col.names = T, sep = "\t")
+
+```
+
+# GSEA
+
+## GSEA prep
+```{r, Build comparisons - adjust as needed}
+
+# Prealloc gct and cls file names
+contrasts_df$gct <- NA
+contrasts_df$cls <- NA
+
+# Nomenclature for specific comparison via GSEA
+contrasts_df$clsComparison <- paste0(contrasts_df$numer, "_versus_", contrasts_df$denom)
+
+# Add path to corresponding chip file
+contrasts_df$chipFile <- chipFile
+
+
+contrasts_df$metric <- GSEAmetric 
+```
+
+## Create gct file with only genes expressed in the given comparison's samples
+```{r, include=TRUE, eval=TRUE}
+library("runGSEA")
+
+# Time stamps
+timestampFiles <- format(Sys.time(), "%Y%m%d.%H%M")
+timestampFilesDay <- format(Sys.time(), "%Y%m%d")
+
+countsMin = 1 
+keep <- rowSums(counts(dds)) >= countsMin
+dds_gct <- DESeq(dds[keep,]) 
+rm(keep)
+
+# Ensure row names match between chip file and output data.
+rownames(dds_gct) <- gtf_gene[rownames(dds_gct), "gene_id_stable"]
+
+# Create gct object from DESeq2 normalized counts data
+normcts_gct <- counts(dds_gct, normalized = TRUE)
+
+
+for(i in 1:nrow(contrasts_df)){
+  
+  # Get samples meta
+  temp_SmpsDF = as.data.frame(colData(dds_gct))
+  temp_SmpsDF_KP = temp_SmpsDF[temp_SmpsDF[,contrasts_df$column[i]] %in% 
+                                 c(contrasts_df$denom[i], contrasts_df$numer[i]),]
+  
+  # Subset to only those samples
+  temp_normcts_gct = normcts_gct[,rownames(temp_SmpsDF_KP)]
+  
+  # Subset to expressed
+  temp_normcts_gct = temp_normcts_gct[rowSums(temp_normcts_gct)>0,]
+  
+  # generate gct format
+  temp_normctsGCT <- new("GCT", 
+                         mat = temp_normcts_gct, 
+                         rdesc = data.frame(gene = rownames(temp_normcts_gct), 
+                                            etc = rownames(temp_normcts_gct), 
+                                            row.names = rownames(temp_normcts_gct)), 
+                         cdesc = temp_SmpsDF_KP[colnames(temp_normcts_gct),])
+  
+  # Define GCT file name
+  temp_fileNameOutGCT = file.path(gseaDataDir, 
+                                  paste(timestampFiles, sraProj, contrasts_df$compLbl[i],
+                                        "ENSGs", "gct", sep = "."))
+  
+  # Write to file
+  write_gct(temp_normctsGCT, temp_fileNameOutGCT, ver = 2, appenddim = F)
+  
+  # Add file path to contrast df
+  contrasts_df$gct[i] <- temp_fileNameOutGCT
+  
+  temp_clsFileNameOut <- file.path(gseaDataDir, 
+                                   paste(timestampFiles, sraProj, 
+                                         contrasts_df$compLbl[i], "cls", sep = "."))
+  write_cls(temp_normctsGCT@cdesc[, contrasts_df$column[i], drop=F], 
+            groupingColName = contrasts_df$column[i], temp_clsFileNameOut)
+  contrasts_df$cls[i] <- temp_clsFileNameOut
+}
+
+```
+
+## gmt prep
+```{r, data frame with gmt files and some GSEA parameters - create df with abbreviations}
+
+# Get list of gmt files
+gmtFileIn <- dir(gmtDir, pattern = gmtFileType, full.names = TRUE, recursive = F)
+names(gmtFileIn) <- gsub(gmtFileType, "", basename(gmtFileIn))
+gmtDF <- as.data.frame(gmtFileIn)
+
+# rownames(gmtDF)
+gmtDF <- gmtDF[gmtsKeep, , drop = F]
+
+# Add some parameters for specific gene sets
+gmtDF$plot_top_x <- 50
+gmtDF$maxGenesInSet <- 500
+
+
+# Customize parameters for gene set collection(s)
+gmtDF[rownames(gmtDF) %in% "h.all", "plot_top_x"] <- 100  # to plot all gene sets
+
+```
+
+## Run GSEA
+```{r, Run GSEA via command prompt for each comparison and each gmt file}
+
+# For each contrast, run comparisons for gmts
+for (j in 1:nrow(contrasts_df)) {
+  
+  # Print comparison and time
+  paste0(contrasts_df$compLbl[j], " - ", format(Sys.time(), "%H:%M"))
+  
+  # Set output directory
+  GSEAresOutDir <- file.path(gseaResDir, contrasts_df$compLbl[j])
+  
+  # Create directory if it does not exist
+  if (!dir.exists(GSEAresOutDir)) { dir.create(GSEAresOutDir, recursive = TRUE) }
+  
+  # Run for each gmt file
+  for (i in 1:nrow(gmtDF)) {
+    
+    # Get java usage
+    temp_javaVal <- checkjava()
+    
+    if (i == 1 & j == 1){
+      if (length(temp_javaVal) > 0){
+        stop("java is already running. This script will not run GSEA if java is already running.")
+      }
+    }
+    
+    # if java is running, pause for set amount of time to prevent from every analysis being submitted at the same ~time
+    while (length(temp_javaVal) > 0) {
+      print(paste0(format(Sys.time(), "%H:%M:%S"), " - waiting 30s"))
+      Sys.sleep(time = 30)
+      temp_javaVal <- checkjava()
+    }
+    
+    # Temp abbreviation
+    GSEArepLbl_tmp <- paste0(rownames(gmtDF)[i], "_", contrasts_df$compLbl[j])
+    print(paste0(GSEArepLbl_tmp, " - ", format(Sys.time(), "%H:%M")))
+    
+    # Run GSEA 
+    runGSEA(pathToBat = pathToBatIn, gctExprFile = contrasts_df$gct[j],
+            clsLabelsFile = contrasts_df$cls[j], clsComparison = contrasts_df$clsComparison[j],
+            GSEArepLbl = GSEArepLbl_tmp, GSEAresOutDir = GSEAresOutDir,
+            metric = contrasts_df$metric[j],
+            gmtFile = gmtDF$gmtFileIn[i], set_max = gmtDF$maxGenesInSet[i],
+            zip_report = F, ChipFile = contrasts_df$chipFile[j], 
+            plot_top_x = gmtDF$plot_top_x[i])
+  }
+}
+
+```
+
+## Save contrasts for running GSEA on other gene set(s)
+```{r}
+fnOutContrasts <- file.path(outDir, "GSEA", "data", 
+                            paste(timestampFiles, setName, "contrasts", "tsv",
+                                  sep = "."))
+
+write.table(contrasts_df, fnOutContrasts, sep = "\t", row.names = F, col.names = T)
+
+```
+
+# Run GSEA on new gmt file(s)
+## Load contrast for analyzing new gmt files
+```{r}
+fnInContrasts <- dir(file.path(outDir, "GSEA", "data"), pattern = "contrasts.tsv")
+contrasts_df <- read.table(fnInContrasts, header = T, sep = "\t")
+
+```
+
+
+
+## gmt prep
+```{r, data frame with gmt files and some GSEA parameters - create df with abbreviations}
+# Get list of gmt files
+gmtFileIn <- dir(gmtDir, pattern = gmtFileType, full.names = TRUE, recursive = F)
+names(gmtFileIn) <- gsub(gmtFileType, "", basename(gmtFileIn))
+gmtDF <- as.data.frame(gmtFileIn)
+
+gmtsKeep <- c("c3.tft")
+
+# rownames(gmtDF)
+gmtDF <- gmtDF[gmtsKeep, , drop = F]
+
+# Add some parameters for specific gene sets
+gmtDF$plot_top_x <- 50
+gmtDF$maxGenesInSet <- 500
+
+
+# Customize parameters for gene set collection(s)
+gmtDF[rownames(gmtDF) %in% "h.all", "plot_top_x"] <- 100  # to plot all gene sets
+
+```
+
+## Run GSEA
+```{r, Run GSEA via command prompt for each comparison and each gmt file}
+
+library("runGSEA")
+
+# For each contrast, run comparisons for gmts
+for (j in 1:nrow(contrasts_df)) {
+
+    # Print comparison and time
+    paste0(contrasts_df$compLbl[j], " - ", format(Sys.time(), "%H:%M"))
+
+    # Set output directory
+    GSEAresOutDir <- file.path(gseaResDir, contrasts_df$compLbl[j])
+
+    # Create directory if it does not exist
+    if (!dir.exists(GSEAresOutDir)) {
+        dir.create(GSEAresOutDir, recursive = TRUE)
+    }
+
+    # Run for each gmt file
+    for (i in 1:nrow(gmtDF)) {
+
+        # Get java usage
+        temp_javaVal <- checkjava()
+        
+        if (i == 1 & j == 1){
+          if (length(temp_javaVal) > 0){
+            stop("java is already running. This script will not run GSEA if java is already running.")
+          }
+        }
+
+        # if java is running, pause for set amount of time to prevent from every analysis being submitted at the same ~time
+        while (length(temp_javaVal) > 0) {
+            print(paste0(format(Sys.time(), "%H:%M:%S"), " - waiting 30s"))
+            Sys.sleep(time = 30)
+
+            temp_javaVal <- checkjava()
+        }
+
+        # Temp abbreviation
+        GSEArepLbl_tmp <- paste0(rownames(gmtDF)[i], "_", contrasts_df$compLbl[j])
+        print(paste0(GSEArepLbl_tmp, " - ", format(Sys.time(), "%H:%M")))
+
+        # Run GSEA 
+        runGSEA(pathToBat = pathToBatIn, gctExprFile = contrasts_df$gct[j],
+            clsLabelsFile = contrasts_df$cls[j], clsComparison = contrasts_df$clsComparison[j],
+            GSEArepLbl = GSEArepLbl_tmp, GSEAresOutDir = GSEAresOutDir,
+            metric = contrasts_df$metric[j],
+            gmtFile = gmtDF$gmtFileIn[i], set_max = gmtDF$maxGenesInSet[i],
+            zip_report = F, ChipFile = contrasts_df$chipFile[j], 
+            plot_top_x = gmtDF$plot_top_x[i])
+    }
+}
+
+```
+

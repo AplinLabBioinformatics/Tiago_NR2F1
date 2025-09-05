@@ -1,0 +1,270 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-01-27"
+---
+
+## Script used to isolate significant NR2F1 binding results
+```{bash}
+head -n 1 /mnt/c/path/to/GTRD/Homo_sapiens_macs2_peaks.interval > /mnt/c/path/to/GTRD/Homo_sapiens_macs2_peaks.NR2F1.interval
+fgrep -w 'NR2F1' /mnt/c/path/to/GTRD/Homo_sapiens_macs2_peaks.interval >> /mnt/c/path/to/GTRD/Homo_sapiens_macs2_peaks.NR2F1.interval
+
+```
+
+# ChIP data
+```{r}
+chipDIR = "C:/path/to/GTRD"
+chipFile = file.path(chipDIR, "Homo_sapiens_macs2_peaks.NR2F1.interval")
+chipData = read.table(chipFile, header = T, sep = "\t", stringsAsFactors = F, quote = "", comment.char = "")
+
+```
+
+## Check experiment metadata
+```{r}
+unique(chipData[, c("experiment", "antibody", "cellLine", "tfClassId", "tfTitle", "uniprotId", "treatment")])
+unique_chipData = unique(chipData[, c("experiment", "antibody", "cellLine", "tfClassId", "tfTitle", "uniprotId", "treatment")])
+
+```
+
+## Reduce to main chromosomes, add peak IDs and create GRanges object
+```{r}
+
+# Reduce to only main chromosome contigs
+chipData[grepl("_", chipData$X.CHROM),]
+chipData = chipData[!grepl("_", chipData$X.CHROM),]
+
+
+# Make unique peak IDs
+chipData$peak_ID = ""
+for(i in unique(chipData$experiment)){
+  tmpMatchLoc = which(chipData$experiment == i)
+  chipData[tmpMatchLoc, "peak_ID"] = 
+    paste0(i, "_", stringr::str_pad(as.character(1:length(tmpMatchLoc)), 
+                                    width = ceiling(log10(length(tmpMatchLoc))), pad = "0"))
+}
+
+# Change names of columns for compatibility with GRanges, reorder
+colnames(chipData)[match(c("X.CHROM", "START", "END", "X.log10.pvalue."), 
+                         colnames(chipData))] = c("chromosome", 'start', 'end', 'Neg.log10.pval')
+chipData = chipData[,unique(c('chromosome', 'start', 'end', 'peak_ID', 'Neg.log10.pval', colnames(chipData)))]
+
+# Create collapsed peak information
+chipData$peak = paste0(chipData$chromosome, ":", chipData$start, "-", chipData$end)
+
+# Create granges object
+chipData.gr.together = GenomicRanges::makeGRangesFromDataFrame(df = chipData, keep.extra.columns = T)
+
+```
+
+# Gene regulatory elements
+## ENCODE v113 gff for processing
+```{r}
+# Create a df with gene names along with ENSG IDs
+gfffile = file.path("C:/path/to/Homo_sapiens.GRCh38.regulatory_features.v113.gff3")
+gff = rtracklayer::import(gfffile)
+
+```
+
+
+## Make references compatible
+```{r}
+GenomeInfoDb::seqlevelsStyle(gff)
+GenomeInfoDb::seqlevelsStyle(chipData.gr.together)
+
+# Make sequence names compatible
+if (!any(GenomeInfoDb::seqlevelsStyle(x = chipData.gr.together) == GenomeInfoDb::seqlevelsStyle(x = gff))) {
+  GenomeInfoDb::seqlevelsStyle(chipData.gr.together) = GenomeInfoDb::seqlevelsStyle(gff)
+}
+
+```
+
+# List of target genes
+## Load in list of common genes
+```{r}
+dirIn = "C:/data/results/CM_NR2F1"
+geneListIn = read.table(file.path(dirIn, "inAll3.mtor.tsv"), header = F, sep = "\t")
+
+```
+
+## get gtf data
+```{r}
+
+# Set gtf file path
+gtffile = "C:/data/reference/gencode.v35.annotation.gtf.gz"
+
+# Create a df with gene names along with ENSG IDs
+gtf_df = as.data.frame(rtracklayer::import(gtffile))
+gtf_gene = unique(gtf_df[,c("gene_name", "gene_id", "gene_type")])
+rownames(gtf_gene) = gtf_gene$gene_id
+
+```
+
+## Update gene identifiers to match what is present in regulatory elements (stable ENSG IDs)
+```{r}
+gtf_genesPresent = gtf_gene[gtf_gene$gene_name %in% geneListIn[,1],]
+gtf_genesPresent$gene_id_stable = gsub("[.]\\d*", "", gtf_genesPresent$gene_id)
+
+```
+
+# Subset Regulatory elements
+## Subset regulatory elements to keep only those that target our list of genes
+```{r}
+# Reduce to only those with a gene
+withSomething = which(lapply(gff$gene_id, length) > 0)
+gff = gff[withSomething,]
+
+# Index list of genes with at least one hit
+listHits = list()
+for(i in 1:length(gff$gene_id)){
+  tmpGeneID = gff$gene_id[[i]]
+  if(any(gtf_genesPresent$gene_id_stable %in% unlist(strsplit(tmpGeneID, split = ";")))){
+    listHits = c(listHits, i)
+  }
+}
+
+## subset to hits
+gff_of_genes = gff[unlist(listHits),]
+
+# Add just the gene id of the hit
+gff_of_genes$gene_id_hit = ""
+
+for(i in 1:length(gff_of_genes$gene_id)){
+  tmpGeneID = gff_of_genes$gene_id[[i]]
+  if(any(gtf_genesPresent$gene_id_stable %in% unlist(strsplit(tmpGeneID, split = ";")))){
+    tmpCollapse = gtf_genesPresent$gene_id_stable[gtf_genesPresent$gene_id_stable 
+                                                  %in% unlist(strsplit(tmpGeneID, split = ";"))]
+    gff_of_genes$gene_id_hit[i] = paste(tmpCollapse, collapse = ";")
+  }
+}
+```
+
+
+## Find overlapping regions between each GRanges object (regulatory and ChIP)
+```{r}
+# Find all chip hits in ENSR data
+gff_of_genes.GTRD.intersect = GenomicRanges::findOverlaps(gff_of_genes, chipData.gr.together, 
+                                         maxgap=-1L, minoverlap=0L, type = "any", "all",)
+gff_of_genes.GTRD.intersect.df = as.data.frame(gff_of_genes.GTRD.intersect)
+
+
+
+gff_of_genes.GTRD.intersect.df$peak_ID = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$peak_ID
+
+gff_of_genes.GTRD.intersect.df$Neg.log10.pval = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$Neg.log10.pval 
+gff_of_genes.GTRD.intersect.df$fold_enrichment = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$fold_enrichment
+gff_of_genes.GTRD.intersect.df$X.log10.qvalue. = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$X.log10.qvalue. 
+gff_of_genes.GTRD.intersect.df$experiment = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$experiment 
+gff_of_genes.GTRD.intersect.df$peak = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$peak 
+gff_of_genes.GTRD.intersect.df$abs_summit = chipData.gr.together[S4Vectors::subjectHits(x = gff_of_genes.GTRD.intersect)]$abs_summit
+
+gff_of_genes.GTRD.intersect.df$ID = gff_of_genes[S4Vectors::queryHits(x = gff_of_genes.GTRD.intersect)]$ID
+gff_of_genes.GTRD.intersect.df$gene_id_stable_hit = gff_of_genes[S4Vectors::queryHits(x = gff_of_genes.GTRD.intersect)]$gene_id_hit
+gff_of_genes.GTRD.intersect.df$originalOrder = 1:nrow(gff_of_genes.GTRD.intersect.df)
+
+```
+
+
+# Reorder by fold enrichment and add info 
+```{r}
+
+# order by enrichment
+gff_of_genes.GTRD.intersect.df = gff_of_genes.GTRD.intersect.df[with(gff_of_genes.GTRD.intersect.df, order(-fold_enrichment)),]
+
+
+## Add gene names to compiled hits
+rownames(gtf_genesPresent) = gtf_genesPresent$gene_id_stable
+
+gff_of_genes.GTRD.intersect.df$gene_id_hit = gtf_genesPresent[gff_of_genes.GTRD.intersect.df$gene_id_stable_hit, "gene_id"]
+gff_of_genes.GTRD.intersect.df$gene_name_hit = gtf_genesPresent[gff_of_genes.GTRD.intersect.df$gene_id_stable_hit, "gene_name"]
+
+
+genesWithNR2F1chipHit = unique(gff_of_genes.GTRD.intersect.df$gene_name_hit)
+genesWithNR2F1chipHit_ensg = unique(gff_of_genes.GTRD.intersect.df$gene_id_hit)
+
+# Adding ChIP info to gene annotation
+gtf_genesPresent[,"NR2F1_Hit"] = NA
+gtf_genesPresent = gtf_genesPresent[!is.na(gtf_genesPresent$gene_id),]
+gtf_genesPresent[unique(gff_of_genes.GTRD.intersect.df$gene_id_stable_hit), "NR2F1_Hit"] = "Hit"
+
+gtf_genesPresent[,"NR2F1_Fold_Enrichment"] = NA
+gtf_genesPresent[,"NR2F1_Fold_Enrichment"] = gff_of_genes.GTRD.intersect.df[match(gtf_genesPresent$gene_name, 
+                                                                                  gff_of_genes.GTRD.intersect.df$gene_name_hit), "fold_enrichment"]
+gtf_genesPresent[,"NR2F1_log_fold_Enrichment"] = log10(gtf_genesPresent[,"NR2F1_Fold_Enrichment"])
+
+# Change back to match ENSG gene ID version
+rownames(gtf_genesPresent) = gtf_genesPresent$gene_id
+```
+
+# Subset to RNAseq samples for final plot
+```{r}
+library(DESeq2)
+
+dds = readRDS("C:/data/results/CM_NR2F1/CM_NR2F1_dds.Rds")
+pAnnot = dds@colData
+pAnnot$doxOrder = match(pAnnot$NR2F1, c("NO_DOX", "DOX"))
+
+pAnnot$Group_ND = factor(pAnnot$group, levels = unique(pAnnot[ with(pAnnot, order(cellLine, doxOrder)), "group"]))
+
+pAnnot_BM = pAnnot[pAnnot$Treatment %in% "Combo",]
+pAnnot_BM = pAnnot_BM[ with(pAnnot_BM, order(cellLine, doxOrder)), ]
+
+```
+
+## Generate heatmap for the expression data
+```{r}
+library(pheatmap)
+
+ntcts_fpkm = DESeq2::fpkm(dds)
+
+tempTimestampDay = format(Sys.time(), "%Y%m%d")
+tempTimestampTime = format(Sys.time(), "%Y%m%d.%H%M")
+
+maxVal=1.5
+
+tmpFileNameOut = file.path(dirIn, paste0(tempTimestampTime, ".mTOR_EnrichedGenes.png"))
+
+pheatmap::pheatmap(log10(ntcts_fpkm[gtf_genesPresent$gene_id,pAnnot_BM$sample]+1),
+         scale = "row", labels_row = gtf_genesPresent$gene_name, 
+         cluster_cols = F, breaks = seq(from=-maxVal, to = maxVal, length.out = 101),
+         cellheight = 10, cellwidth = 10, filename = tmpFileNameOut)
+
+
+# For generating supplementary file data
+toOut = log10(ntcts_fpkm[gtf_genesPresent$gene_id,pAnnot_BM$sample]+1)
+rownames(toOut) = gtf_genesPresent$gene_name
+
+toOut_z = t(scale(t(toOut)))
+
+# confirm they are the same
+pheatmap::pheatmap(toOut_z, scale = "none", cluster_cols = F, 
+                   breaks = seq(from=-maxVal, to = maxVal, length.out = 101)) 
+
+# write data to file
+tmpFileNameOutData = file.path(dirIn, paste0(tempTimestampTime, ".NR2F1_ChIP.common.mTOR_EnrichedGenes_zscores.tsv"))
+
+write.table(as.data.frame(toOut_z), file = tmpFileNameOutData, sep = "\t", row.names = T, col.names = NA, quote = FALSE)
+
+
+
+```
+
+## Methods write-up
+```{r}
+
+if (!exists("methodsUsed")){
+  methodsUsed = paste0("MACS2 [18798982] ChIP Seq binding results for experiments targeting NR2F1 (n=5) were obtained from the Gene Transcription Regulation Database (GTRD) [30445619]. Gene regulation data with promoter-transcript matches were obtained from Ensembl (v113)[25887522] for the human reference genome build GRCh38. Statistically significant MACS2 peaks (padj < 0.05) were used for identifying overlaps between promoter regions with annotated binding to the commonly enriched mTOR genes. ")
+} else {
+  methodsUsed[length(methodsUsed)+1 ] = paste0("MACS2 [18798982] ChIP Seq binding results for experiments targeting NR2F1 (n=5) were obtained from the Gene Transcription Regulation Database (GTRD) [30445619]. Gene regulation data with promoter-transcript matches were obtained from Ensembl (v113)[25887522] for the human reference genome build GRCh38. Statistically significant MACS2 peaks (padj < 0.05) were used for identifying overlaps between promoter regions with annotated binding to the commonly enriched mTOR genes. ")
+}
+
+methodsUsed[length(methodsUsed)+1 ] = paste0("Overlapping regions between MACS2 peaks and Ensembl regulatory elements was conducted using the GenomicRanges (v", packageVersion("GenomicRanges"), ") [23950696], rtracklayer (v", packageVersion("rtracklayer"), ") [19468054] and GenomeInfoDb (v", packageVersion("GenomeInfoDb"), " https://bioconductor.org/packages/GenomeInfoDb) packages.")
+
+methodsUsed[length(methodsUsed)+1 ] = paste0("Heatmaps were generated using the pheatmap package (v", packageVersion("pheatmap"), " https://CRAN.R-project.org/package=pheatmap).")
+
+methodsUsed[length(methodsUsed)+1 ] = paste0("Data were analyzed in R (v", getRversion(), " https://www.r-project.org) via Rstudio (v", RStudio.Version()$version, " http://www.posit.co).")
+
+methodsFile = file.path(outputDir, paste0(tempTimestampTime, ".methods_writeup.txt"))
+
+write.table(methodsUsed, file = methodsFile, row.names = F, col.names = F)
+```
+
